@@ -1,9 +1,6 @@
-// +build ignore
-// ^^ this is a golang build tag meant to exclude this C file from compilation
-// by the CGO compiler
-
 // This file was copied from
-// https://github.com/parca-dev/parca-agent/blob/31253527651ebebb74c6200eb68fe9251479ed6b/parca-agent.bpf.c.
+// https://github.com/parca-dev/parca-agent/blob/31253527651ebebb74c6200eb68fe9251479ed6b/parca-agent.bpf.c
+// with minor refactoring.
 
 /* In Linux 5.4 asm_inline was introduced, but it's not supported by clang.
  * Redefine it to just asm to enable successful compilation.
@@ -20,11 +17,11 @@
 #define KBUILD_MODNAME "parca-agent"
 
 #undef container_of
-//#include "bpf_core_read.h"
 #include <bpf_core_read.h>
 #include <bpf_endian.h>
 #include <bpf_helpers.h>
 #include <bpf_tracing.h>
+#include "maps.bpf.h"
 
 #if defined(bpf_target_x86)
 #define PT_REGS_PARM6(ctx) ((ctx)->r9)
@@ -32,62 +29,38 @@
 #define PT_REGS_PARM6(x) (((PT_REGS_ARM64 *)(x))->regs[5])
 #endif
 
-// Max amount of different stack trace addresses to buffer in the Map
+// Max amount of different stack trace addresses to buffer in the map.
 #define MAX_STACK_ADDRESSES 1024
-// Max depth of each stack trace to track
+// Max depth of each stack trace to track.
 #define MAX_STACK_DEPTH 127
-
-#define BPF_MAP(_name, _type, _key_type, _value_type, _max_entries)            \
-  struct {                                                                     \
-    __uint(type, _type);                                                       \
-    __uint(max_entries, _max_entries);                                         \
-    __type(key, _key_type);                                                    \
-    __type(value, _value_type);                                                \
-  } _name SEC(".maps");
-
-// Stack Traces are slightly different
-// in that the value is 1 big byte array
-// of the stack addresses
+// Stack trace value is 1 big byte array of the stack addresses.
 typedef __u64 stack_trace_type[MAX_STACK_DEPTH];
-#define BPF_STACK_TRACE(_name, _max_entries)                                   \
-  BPF_MAP(_name, BPF_MAP_TYPE_STACK_TRACE, u32, stack_trace_type, _max_entries);
 
-#define BPF_HASH(_name, _key_type, _value_type)                                \
-  BPF_MAP(_name, BPF_MAP_TYPE_HASH, _key_type, _value_type, 10240);
+// The stack_traces map holds an array of memory addresses,
+// e.g., stack_traces[1253] = [0xdeadbeef, 0x123abcde]
+// where 1253 is a stack ID.
+struct {
+  __uint(type, BPF_MAP_TYPE_STACK_TRACE);
+  __uint(max_entries, MAX_STACK_ADDRESSES);
+  __type(key, u32);
+  __type(value, stack_trace_type);
+} stack_traces SEC(".maps");
 
-/*============================= INTERNAL STRUCTS ============================*/
-
-typedef struct stack_count_key {
+struct stack_count_key_t {
   u32 pid;
-  int user_stack_id;
-  int kernel_stack_id;
-} stack_count_key_t;
+  int32 user_stack_id;
+  int32 kernel_stack_id;
+};
 
-/*================================ MAPS =====================================*/
+// The counts map keeps track of how many times a stack trace has been seen,
+// e.g., counts[{10342, 1253, 0234}] = 45 times.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 10240);
+  __type(key, struct stack_count_key_t);
+  __type(value, u64);
+} counts SEC(".maps");
 
-BPF_HASH(counts, stack_count_key_t, u64);
-BPF_STACK_TRACE(stack_traces, MAX_STACK_ADDRESSES);
-
-/*=========================== HELPER FUNCTIONS ==============================*/
-
-static __always_inline void *
-bpf_map_lookup_or_try_init(void *map, const void *key, const void *init) {
-  void *val;
-  long err;
-
-  val = bpf_map_lookup_elem(map, key);
-  if (val)
-    return val;
-
-  err = bpf_map_update_elem(map, key, init, BPF_NOEXIST);
-  // 17 == EEXIST
-  if (err && err != -17)
-    return 0;
-
-  return bpf_map_lookup_elem(map, key);
-}
-
-// This code gets a bit complex. Probably not suitable for casual hacking.
 SEC("perf_event")
 int do_sample(struct bpf_perf_event_data *ctx) {
   u64 id = bpf_get_current_pid_tgid();
@@ -97,20 +70,22 @@ int do_sample(struct bpf_perf_event_data *ctx) {
   if (pid == 0)
     return 0;
 
-  // create map key
-  stack_count_key_t key = {.pid = tgid};
-
-  // get stacks
+  // Create a key for "counts" map.
+  struct stack_count_key_t key = {.pid = tgid};
+  // Read user-space stack ID and insert memory addresses into stack_traces map.
+  // The positive or null stack id is returned on success,
+  // or a negative error in case of failure.
   key.user_stack_id = bpf_get_stackid(ctx, &stack_traces, BPF_F_USER_STACK);
+  // Read kernel-space stack ID and insert memory addresses into stack_traces map.
   key.kernel_stack_id = bpf_get_stackid(ctx, &stack_traces, 0);
 
   u64 zero = 0;
-  u64 *count;
-  count = bpf_map_lookup_or_try_init(&counts, &key, &zero);
-  if (!count)
+  u64 *seen;
+  seen = bpf_map_lookup_or_try_init(&counts, &key, &zero);
+  if (!seen)
     return 0;
-
-  __sync_fetch_and_add(count, 1);
+  // Atomically increments the seen counter.
+  __sync_fetch_and_add(seen, 1);
 
   return 0;
 }
