@@ -1,12 +1,19 @@
 //go:build linux
 
 /*
-Program profiler is a CPU profiler based on Parca Agent.
+Program profiler2 is a CPU profiler based on Parca Agent.
 It takes PID as an input and samples the process 100 times per second.
+
+The traced memory addresses (stack traces) of user and
+kernel space are printed every second.
+Additionally, the program parses and prints a memory map file of a given process
+using github.com/google/pprof.
 */
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -17,10 +24,15 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/google/pprof/profile"
 	"golang.org/x/sys/unix"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cflags $BPF_CFLAGS -cc clang-13 ParcaAgent ./bpf/parca-agent.bpf.c -- -I../../headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cflags $BPF_CFLAGS -cc clang-13 ParcaAgent ../profiler/bpf/parca-agent.bpf.c -- -I../../headers
+
+// stackDepth is the max depth of each stack trace to track.
+// as defined in BPF C program, i.e., MAX_STACK_DEPTH constant.
+const stackDepth = 127
 
 func main() {
 	// By default an exit code is set to indicate a failure since
@@ -28,18 +40,34 @@ func main() {
 	exitCode := 1
 	defer func() { os.Exit(exitCode) }()
 
-	pid := flag.Int("pid", -1, "PID whose stack traces should be collected (default is all processes)")
+	pid := flag.Int("pid", 0, "PID whose stack traces should be collected")
 	flag.Parse()
+
+	// Open and parse a memory map file of a given process.
+	path := fmt.Sprintf("/proc/%d/maps", *pid)
+	f, err := os.Open(path)
+	if err != nil {
+		log.Printf("failed to open memory map file: %v", err)
+		return
+	}
+	defer f.Close()
+
+	mm, err := profile.ParseProcMaps(f)
+	if err != nil {
+		log.Printf("failed to parse memory map file: %v", err)
+		return
+	}
+	fmt.Println(path)
+	for _, m := range mm {
+		fmt.Printf("start=0x%x limit=0x%x offset=0x%x %s\n", m.Start, m.Limit, m.Offset, m.File)
+	}
 
 	// Increase the resource limit of the current process to provide sufficient space
 	// for locking memory for the BPF maps.
-	err := unix.Setrlimit(
-		unix.RLIMIT_MEMLOCK,
-		&unix.Rlimit{
-			Cur: unix.RLIM_INFINITY,
-			Max: unix.RLIM_INFINITY,
-		},
-	)
+	err = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{
+		Cur: unix.RLIM_INFINITY,
+		Max: unix.RLIM_INFINITY,
+	})
 	if err != nil {
 		log.Printf("failed to set temporary RLIMIT_MEMLOCK: %v", err)
 		return
@@ -126,7 +154,7 @@ func main() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	fmt.Println("Waiting for stack traces...")
+	fmt.Println("\nWaiting for stack traces...")
 Loop:
 	for {
 		select {
@@ -134,12 +162,39 @@ Loop:
 			break Loop
 		case <-ticker.C:
 			var (
-				key   stackCountKey
-				value uint64
+				key  stackCountKey
+				seen uint64
 			)
 			it := objs.ParcaAgentMaps.Counts.Iterate()
-			for it.Next(&key, &value) {
-				fmt.Printf("%+v seen %d times\n", key, value)
+
+			for it.Next(&key, &seen) {
+				fmt.Printf("%+v seen %d times\n", key, seen)
+
+				stackBytes, err := objs.ParcaAgentMaps.StackTraces.LookupBytes(key.UserStackID)
+				if err != nil {
+					log.Printf("failed to look up user-space stack traces: %v", err)
+					continue
+				}
+				userStack := [stackDepth]uint64{}
+				err = binary.Read(bytes.NewBuffer(stackBytes), binary.LittleEndian, userStack[:])
+				if err != nil {
+					log.Printf("failed to read user-space stack traces: %v", err)
+					continue
+				}
+				fmt.Printf("\t%d %x\n", key.UserStackID, tracedAddresses(userStack))
+
+				stackBytes, err = objs.ParcaAgentMaps.StackTraces.LookupBytes(key.KernelStackID)
+				if err != nil {
+					log.Printf("failed to look up kernel-space stack traces: %v", err)
+					continue
+				}
+				kernelStack := [stackDepth]uint64{}
+				err = binary.Read(bytes.NewBuffer(stackBytes), binary.LittleEndian, kernelStack[:])
+				if err != nil {
+					log.Printf("failed to read kernel-space stack traces: %v", err)
+					continue
+				}
+				fmt.Printf("\t%d %x\n", key.KernelStackID, tracedAddresses(kernelStack))
 			}
 			if err = it.Err(); err != nil {
 				log.Printf("failed to read from Counts map: %v", err)
@@ -158,4 +213,13 @@ type stackCountKey struct {
 	PID           uint32
 	UserStackID   int32
 	KernelStackID int32
+}
+
+func tracedAddresses(stack [stackDepth]uint64) []uint64 {
+	for i, addr := range stack {
+		if addr == 0 {
+			return stack[:i]
+		}
+	}
+	return nil
 }
