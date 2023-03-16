@@ -10,7 +10,10 @@ It instructs the kernel to call the BPF program 100 times per second.
 Parca Agent relies on [cgo bindings for libbpf](https://github.com/aquasecurity/libbpfgo) from Aqua Security.
 I wanted to make something similar using
 [github.com/cilium/ebpf](https://github.com/cilium/ebpf) which doesn't need cgo.
-See the related blog post [Continuous profiling in Go](https://marselester.com/continuous-profiling-in-go.html).
+See the related blog posts:
+
+- [Continuous profiling in Go](https://marselester.com/continuous-profiling-in-go.html)
+- [DIY CPU profiler: from BPF maps to pprof](https://marselester.com/diy-cpu-profiler-from-bpf-maps-to-pprof.html)
 
 ## Setup
 
