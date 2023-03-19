@@ -269,11 +269,14 @@ func fillProfile(counts, stackTraces *ebpf.Map, prof *profile.Profile, pid int, 
 		err = binary.Read(bytes.NewBuffer(stackBytes), binary.LittleEndian, kernelStack[:])
 		if err != nil {
 			log.Printf("failed to read kernel-space stack traces: %v", err)
-			continue
+			// Even if we couldn't get a kernel stack trace,
+			// continue to create a profile because
+			// in this version only a user stack is included into a pprof.
+		} else {
+			fmt.Printf("\t%d %x\n", key.KernelStackID, tracedAddresses(kernelStack))
 		}
-		fmt.Printf("\t%d %x\n", key.KernelStackID, tracedAddresses(kernelStack))
 
-		// Collect User stack trace samples.
+		// Collect user-space stack trace samples.
 		sampleLocations := []*profile.Location{}
 		for _, addr := range userStack {
 			if addr == 0 {
@@ -284,8 +287,8 @@ func fillProfile(counts, stackTraces *ebpf.Map, prof *profile.Profile, pid int, 
 			// and append it to the current sample's locations.
 			//
 			// In case a location wasn't found, create one.
-			key := locationIndex{pid, addr}
-			locIndex, found := locationIndices[key]
+			locKey := locationIndex{pid, addr}
+			locIndex, found := locationIndices[locKey]
 			if !found {
 				m := mappingForAddr(mm, addr)
 				if m == nil {
@@ -305,7 +308,7 @@ func fillProfile(counts, stackTraces *ebpf.Map, prof *profile.Profile, pid int, 
 					// It can be nil if the mapping is unknown.
 					Mapping: m,
 				})
-				locationIndices[key] = locIndex
+				locationIndices[locKey] = locIndex
 			}
 
 			sampleLocations = append(sampleLocations, prof.Location[locIndex])
