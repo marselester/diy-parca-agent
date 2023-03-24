@@ -14,6 +14,7 @@ See the related blog posts:
 
 - [Continuous profiling in Go](https://marselester.com/continuous-profiling-in-go.html)
 - [DIY CPU profiler: from BPF maps to pprof](https://marselester.com/diy-cpu-profiler-from-bpf-maps-to-pprof.html)
+- [DIY CPU profiler: the simplest case of symbolization](https://marselester.com/diy-cpu-profiler-the-simplest-case-of-symbolization.html)
 
 ## Setup
 
